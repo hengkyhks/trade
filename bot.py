@@ -1,5 +1,17 @@
 # ============================================================
-#  BOT.PY — Main orchestrator (fixed: dedup + raydium wait)
+#  BOT.PY — Main Orchestrator (2026 EDITION)
+#
+#  ALUR:
+#  1. WebSocket subscribe ke MIGRATION_ACCOUNT
+#     → detect PumpSwap migration (event "migrate") ← UTAMA 2026
+#     → detect Raydium migration (event "initialize2") ← legacy
+#  2. Resolve token mint dari tx
+#  3. Tunggu konfirmasi listing di DEX (PumpSwap/Raydium)
+#  4. Filter anti-rug (liquidity, volume, holder, mint authority)
+#  5. Track harga, deteksi pola 3-dip
+#  6. Buy saat dip3+bounce, sell saat TP/SL
+#  7. Polling fallback tiap 60 detik (safety net)
+#  8. Graceful shutdown: sell semua posisi terbuka saat Ctrl+C
 # ============================================================
 import sys
 import time
@@ -8,9 +20,15 @@ import threading
 
 from config import (
     POLL_INTERVAL_SEC, TAKE_PROFIT_PCT, STOP_LOSS_PCT,
-    MAX_POSITIONS, LOG_FILE, BUY_AMOUNT_SOL
+    MAX_POSITIONS, LOG_FILE, BUY_AMOUNT_SOL,
+    validate_config
 )
-from monitor import PumpFunListener, get_current_price, is_on_raydium, get_tokens_near_bond
+from monitor import (
+    PumpFunMigrationListener,
+    get_current_price,
+    is_on_supported_dex,
+    get_tokens_near_bond,
+)
 from filters import is_token_safe
 from dip_detector import TokenTracker, DipPhase
 from trader import buy_token, sell_token, get_token_balance
@@ -29,24 +47,31 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# ── State global ────────────────────────────────────────────
+# ── Global state (semua akses pakai tracker_lock) ─────────
 active_trackers: dict[str, TokenTracker] = {}
-positions: dict[str, dict] = {}
-seen_addresses: set[str] = set()   # <-- dedup cache
+positions:       dict[str, dict]         = {}
+seen_addresses:  set[str]                = set()
 tracker_lock = threading.Lock()
 
-RAYDIUM_WAIT_MAX = 60   # detik maksimal tunggu token masuk Raydium
-RAYDIUM_POLL_SEC = 3    # cek tiap 3 detik
+DEX_WAIT_MAX = 60    # max detik tunggu token listing di DEX
+DEX_POLL_SEC = 3     # poll tiap 3 detik
 
+
+# ── Callback dari WebSocket ───────────────────────────────
 
 def on_token_bonded(token_info: dict):
-    address = token_info.get("address")
-    name    = token_info.get("name", "Unknown")
+    """
+    Dipanggil saat migration account deteksi token baru.
+    Bisa dari PumpSwap (migrate event) atau Raydium (initialize2).
+    """
+    address        = token_info.get("address")
+    name           = token_info.get("name", "Unknown")
+    migration_type = token_info.get("migration_type", "Unknown")
+
     if not address:
         return
 
     with tracker_lock:
-        # ── DEDUP: skip kalau sudah pernah diproses ──
         if address in seen_addresses:
             return
         seen_addresses.add(address)
@@ -55,102 +80,146 @@ def on_token_bonded(token_info: dict):
             log.info(f"[SKIP] {name}: max posisi ({MAX_POSITIONS}) tercapai")
             return
 
-    log.info(f"[NEW] Token bond: {name} ({address})")
+    log.info(f"[NEW] {migration_type} bond: {name} ({address[:20]}...)")
+    threading.Thread(
+        target=_process_token,
+        args=(address, name, migration_type),
+        daemon=True
+    ).start()
 
-    # Jalankan di thread terpisah supaya tidak blocking
-    t = threading.Thread(target=_process_token, args=(address, name), daemon=True)
-    t.start()
 
+def _process_token(address: str, name: str, migration_type: str):
+    """
+    1. Tunggu token listing di DEX (confirm via Dexscreener)
+    2. Filter anti-rug
+    3. Mulai tracking
+    """
+    log.info(f"[WAIT] Tunggu {name} ({migration_type}) listing di DEX...")
+    deadline  = time.time() + DEX_WAIT_MAX
+    dex_found = False
+    dex_id    = ""
 
-def _process_token(address: str, name: str):
-    """Tunggu token masuk Raydium, lalu jalankan filter & tracking."""
-
-    # ── Tunggu sampai token ada di Raydium (max 60 detik) ──
-    log.info(f"[WAIT] Tunggu {name} masuk Raydium...")
-    deadline = time.time() + RAYDIUM_WAIT_MAX
-    on_raydium = False
     while time.time() < deadline:
-        if is_on_raydium(address):
-            on_raydium = True
+        listed, dex_id = is_on_supported_dex(address)
+        if listed:
+            dex_found = True
             break
-        time.sleep(RAYDIUM_POLL_SEC)
+        time.sleep(DEX_POLL_SEC)
 
-    if not on_raydium:
-        log.info(f"[SKIP] {name}: tidak masuk Raydium dalam {RAYDIUM_WAIT_MAX}s")
+    if not dex_found:
+        log.info(f"[SKIP] {name}: tidak listing di DEX dalam {DEX_WAIT_MAX}s")
         return
 
-    log.info(f"[RAYDIUM] {name} sudah listing!")
+    log.info(f"[DEX] {name} listing di {dex_id}! Jalankan filter...")
 
-    # ── Filter anti-rug ──
+    # Filter anti-rug
     safe, reason = is_token_safe(address)
     if not safe:
         log.info(f"[FILTER] {name}: {reason}")
         return
 
-    # ── Ambil harga listing ──
+    # Ambil harga listing
     listing_price = get_current_price(address)
     if listing_price <= 0:
         log.info(f"[SKIP] {name}: harga tidak tersedia")
         return
 
-    log.info(f"[OK] {name} lolos filter. Price: ${listing_price:.8f}")
+    log.info(
+        f"[OK] {name} lolos filter | DEX: {dex_id} | "
+        f"Price: ${listing_price:.8f}"
+    )
 
     with tracker_lock:
         if address in active_trackers:
             return
         if len(positions) >= MAX_POSITIONS:
-            log.info(f"[SKIP] {name}: max posisi sudah penuh")
+            log.info(f"[SKIP] {name}: max posisi penuh")
             return
 
         tracker = TokenTracker(
-            address=address,
-            name=name,
-            listing_price=listing_price,
-            ath=listing_price,
-            last_local_high=listing_price,
+            address        = address,
+            name           = name,
+            listing_price  = listing_price,
+            migration_type = migration_type,
         )
         active_trackers[address] = tracker
 
-    t = threading.Thread(target=track_token_loop, args=(tracker,), daemon=True)
-    t.start()
+    threading.Thread(
+        target=track_token_loop,
+        args=(tracker,),
+        daemon=True
+    ).start()
 
+
+# ── Price tracking loop ───────────────────────────────────
 
 def track_token_loop(tracker: TokenTracker):
-    log.info(f"[TRACK] Mulai tracking {tracker.name}")
+    log.info(f"[TRACK] 🔍 Mulai tracking {tracker.name} ({tracker.migration_type})")
 
-    while tracker.phase not in (DipPhase.DONE,):
+    while True:
         time.sleep(POLL_INTERVAL_SEC)
+
+        with tracker_lock:
+            if tracker.phase == DipPhase.DONE:
+                break
+
         price = get_current_price(tracker.address)
         if price <= 0:
             continue
 
-        phase = tracker.update_price(price)
+        with tracker_lock:
+            phase = tracker.update_price(price)
 
-        if phase == DipPhase.ENTRY and tracker.address not in positions:
-            log.info(f"[BUY] {tracker.name} @ ${price:.8f}")
-            result = buy_token(tracker.address, BUY_AMOUNT_SOL)
-            if result["success"]:
-                token_balance = get_token_balance(tracker.address)
-                positions[tracker.address] = {
-                    "amount": token_balance,
-                    "entry_price": price,
-                    "tx_buy": result["tx"],
-                }
-                tracker.entry_price = price
-                tracker.phase = DipPhase.HOLDING
-                log.info(f"[BUY OK] Balance: {token_balance} | TX: {result['tx']}")
-            else:
-                log.error(f"[BUY FAIL] {tracker.name}")
-                tracker.phase = DipPhase.DONE
+        # ── BUY trigger ─────────────────────────────────
+        if phase == DipPhase.ENTRY:
+            with tracker_lock:
+                already_in = tracker.address in positions
+            if not already_in:
+                log.info(f"[BUY] {tracker.name} @ ${price:.8f}")
+                result = buy_token(tracker.address, BUY_AMOUNT_SOL)
 
-        elif phase == DipPhase.HOLDING and tracker.address in positions:
-            pos = positions[tracker.address]
+                if result["success"]:
+                    balance = get_token_balance(tracker.address)
+                    if balance == 0:
+                        balance = result.get("out_amount", 0)
+
+                    with tracker_lock:
+                        positions[tracker.address] = {
+                            "amount":      balance,
+                            "entry_price": price,
+                            "tx_buy":      result["tx"],
+                        }
+                        tracker.entry_price = price
+                        tracker.phase       = DipPhase.HOLDING
+
+                    log.info(
+                        f"[BUY OK] {tracker.name} | "
+                        f"Balance: {balance} | TX: {result['tx']}"
+                    )
+                else:
+                    log.error(f"[BUY FAIL] {tracker.name}")
+                    with tracker_lock:
+                        tracker.phase = DipPhase.DONE
+
+        # ── TP / SL check ────────────────────────────────
+        elif phase == DipPhase.HOLDING:
+            with tracker_lock:
+                pos = positions.get(tracker.address)
+            if pos is None:
+                continue
+
             pnl = tracker.get_pnl(price)
+
             if pnl >= TAKE_PROFIT_PCT:
-                log.info(f"[TP] {tracker.name}: +{pnl*100:.1f}% @ ${price:.8f}")
+                log.info(
+                    f"[TP] {tracker.name}: +{pnl*100:.1f}% @ ${price:.8f}"
+                )
                 _do_sell(tracker, pos, price, "take_profit")
+
             elif pnl <= -STOP_LOSS_PCT:
-                log.info(f"[SL] {tracker.name}: {pnl*100:.1f}% @ ${price:.8f}")
+                log.info(
+                    f"[SL] {tracker.name}: {pnl*100:.1f}% @ ${price:.8f}"
+                )
                 _do_sell(tracker, pos, price, "stop_loss")
 
     with tracker_lock:
@@ -159,40 +228,64 @@ def track_token_loop(tracker: TokenTracker):
 
 
 def _do_sell(tracker: TokenTracker, pos: dict, price: float, reason: str):
-    result = sell_token(tracker.address, pos["amount"])
+    result  = sell_token(tracker.address, pos["amount"])
     pnl_pct = tracker.get_pnl(price) * 100
+
     if result["success"]:
         log.info(
             f"[SELL OK] {tracker.name} [{reason}] | "
-            f"PnL: {pnl_pct:+.1f}% | SOL: {result['sol_received']:.4f} | TX: {result['tx']}"
+            f"PnL: {pnl_pct:+.1f}% | "
+            f"SOL: {result['sol_received']:.4f} | "
+            f"TX: {result['tx']}"
         )
     else:
-        log.error(f"[SELL FAIL] {tracker.name} - MANUAL SELL di Raydium sekarang!")
-    positions.pop(tracker.address, None)
-    tracker.phase = DipPhase.DONE
+        log.error(
+            f"[SELL FAIL] {tracker.name} [{reason}] — "
+            f"MANUAL SELL! Amount: {pos['amount']}"
+        )
 
+    with tracker_lock:
+        positions.pop(tracker.address, None)
+        tracker.phase = DipPhase.DONE
+
+
+# ── Polling fallback ──────────────────────────────────────
 
 def polling_loop():
-    log.info("[POLL] Polling fallback loop started")
+    """
+    Safety net: polling tiap 60 detik untuk token yang miss dari WS.
+    Ambil token terbaru dari PumpSwap + Raydium via Dexscreener.
+    """
+    log.info("[POLL] Polling fallback started (interval: 60s)")
     while True:
-        time.sleep(60)  # polling tiap 60 detik, lebih hemat
-        tokens = get_tokens_near_bond()
-        for t in tokens:
-            on_token_bonded(t)  # dedup sudah handle duplikat
+        time.sleep(60)
+        try:
+            tokens = get_tokens_near_bond()
+            for t in tokens:
+                on_token_bonded(t)
+        except Exception as e:
+            log.warning(f"[POLL] Error: {e}")
 
+
+# ── Entry point ───────────────────────────────────────────
 
 def main():
-    log.info("=" * 55)
-    log.info("  SOLANA POST-BOND SCALPING BOT - Starting...")
+    validate_config()
+
+    log.info("=" * 60)
+    log.info("  🚀 SOLANA POST-BOND SCALPING BOT 2026")
+    log.info("  Target: PumpSwap (95%+) + Raydium (legacy)")
     log.info(f"  Max posisi  : {MAX_POSITIONS}")
     log.info(f"  Buy amount  : {BUY_AMOUNT_SOL} SOL")
     log.info(f"  Take profit : {TAKE_PROFIT_PCT*100:.0f}%")
     log.info(f"  Stop loss   : {STOP_LOSS_PCT*100:.0f}%")
-    log.info("=" * 55)
+    log.info("=" * 60)
 
-    listener = PumpFunListener(callback_bond=on_token_bonded)
+    # Start WS listener (deteksi real-time < 1 detik)
+    listener = PumpFunMigrationListener(callback_bond=on_token_bonded)
     listener.start()
 
+    # Start polling fallback
     poll_thread = threading.Thread(target=polling_loop, daemon=True)
     poll_thread.start()
 
@@ -200,14 +293,44 @@ def main():
         while True:
             time.sleep(15)
             with tracker_lock:
-                log.info(
-                    f"[STATUS] Tracking: {len(active_trackers)} | "
-                    f"Positions: {len(positions)}/{MAX_POSITIONS} | "
-                    f"Seen: {len(seen_addresses)} tokens"
-                )
+                n_track = len(active_trackers)
+                n_pos   = len(positions)
+                n_seen  = len(seen_addresses)
+                pos_info = [
+                    f"{k[:6]}:{v.get('amount',0)}"
+                    for k, v in positions.items()
+                ]
+            log.info(
+                f"[STATUS] Tracking: {n_track} | "
+                f"Posisi: {n_pos}/{MAX_POSITIONS} | "
+                f"Seen: {n_seen} | "
+                f"Holdings: {pos_info or 'none'}"
+            )
+
     except KeyboardInterrupt:
-        log.info("Bot dihentikan.")
+        log.info("\n🛑 Bot dihentikan. Menutup semua posisi...")
         listener.stop()
+
+        # Graceful exit: sell semua posisi terbuka
+        with tracker_lock:
+            open_pos     = dict(positions)
+            open_tracker = dict(active_trackers)
+
+        if open_pos:
+            log.info(f"Menutup {len(open_pos)} posisi...")
+            for addr, pos in open_pos.items():
+                price   = get_current_price(addr)
+                tracker = open_tracker.get(addr)
+                if tracker:
+                    _do_sell(tracker, pos, price, "shutdown")
+                else:
+                    result = sell_token(addr, pos["amount"])
+                    if result["success"]:
+                        log.info(f"[SELL OK] {addr[:20]} shutdown")
+                    else:
+                        log.error(f"[SELL FAIL] {addr[:20]} — manual sell!")
+
+        log.info("✅ Bot selesai.")
 
 
 if __name__ == "__main__":
